@@ -1,78 +1,153 @@
-// --- Set up the elements and Render connection ---
+// client.js - fixed version
+
 const localVideo = document.getElementById('localVideo');
 const remoteVideo = document.getElementById('remoteVideo');
 const callButton = document.getElementById('callButton');
 const roomIdDisplay = document.getElementById('room-id');
 
-// The socket connects to the Render server
-const socket = io(); 
-let peerConnection;
-const room = 'mya_super_secret_room'; // The shared chat channel name
+const socket = io();
+let peerConnection = null;
+let localStream = null;
+const room = 'mya_super_secret_room';
 roomIdDisplay.textContent = room;
 
-// --- WebRTC Configuration ---
 const config = {
-    'iceServers': [{ 'urls': 'stun:stun.l.google.com:19302' }]
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
 };
 
-// --- Step 1: Get Camera and Mic Access ---
-callButton.onclick = async () => {
-    try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        localVideo.srcObject = stream;
-        
-        // Step 2: Set up the chat connection
-        setupPeerConnection(stream);
-        
-        socket.emit('join', room);
-        callButton.textContent = "Waiting for friend...";
-        callButton.disabled = true;
-    } catch (error) {
-        console.error('Error accessing media devices.', error);
-        alert('Cannot access camera/mic. Check phone permissions!');
+// Register socket listeners ONCE
+socket.on('connect', () => {
+  console.log('socket connected', socket.id);
+});
+
+socket.on('ready', async (peerId) => {
+  console.log('ready from', peerId);
+  // If someone else joined the room, create an offer (caller)
+  if (peerId !== socket.id) {
+    if (!peerConnection) {
+      setupPeerConnection(localStream);
     }
+    try {
+      // createOffer -> setLocalDescription -> send to remote
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.emit('signal', { room, sdp: peerConnection.localDescription });
+      callButton.textContent = "Chatting! 🥳";
+      callButton.disabled = true;
+    } catch (err) {
+      console.error('Failed to create/send offer', err);
+    }
+  }
+});
+
+socket.on('signal', async (data) => {
+  // data may be { room, sdp } or { room, candidate }
+  if (!peerConnection) {
+    // create peerConnection lazily if we have localStream (or later after getUserMedia)
+    setupPeerConnection(localStream);
+  }
+
+  try {
+    if (data.sdp) {
+      const sdp = data.sdp;
+      console.log('Received SDP', sdp.type);
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));
+      if (sdp.type === 'offer') {
+        // create and send answer
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socket.emit('signal', { room, sdp: peerConnection.localDescription });
+        callButton.textContent = "Chatting! 🥳";
+        callButton.disabled = true;
+      }
+      // if it's an 'answer', setRemoteDescription already handled above
+    } else if (data.candidate) {
+      try {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+      } catch (err) {
+        // This can happen if candidate arrives before remote description; it's safe to ignore or log
+        console.warn('addIceCandidate failed', err);
+      }
+    }
+  } catch (err) {
+    console.error('Error handling signal', err);
+  }
+});
+
+// Button -> get media & join room
+callButton.onclick = async () => {
+  try {
+    callButton.disabled = true;
+    callButton.textContent = 'Starting...';
+
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localStream;
+
+    // Create the peer connection and attach local tracks
+    if (!peerConnection) setupPeerConnection(localStream);
+
+    // Join the shared room (server will emit 'ready' to others in the room)
+    socket.emit('join', room);
+    callButton.textContent = 'Waiting for friend...';
+  } catch (error) {
+    console.error('Error accessing media devices.', error);
+    alert('Cannot access camera/mic. Check permissions and try again.');
+    callButton.disabled = false;
+    callButton.textContent = 'Start a Sparkle Call';
+  }
 };
 
-// --- Step 2 & 3: Handle the connection ---
 function setupPeerConnection(stream) {
-    peerConnection = new RTCPeerConnection(config);
-    
-    stream.getTracks().forEach(track => peerConnection.addTrack(track, stream));
+  // If already exist, do nothing (or optionally close & recreate)
+  if (peerConnection) return;
 
-    // When the friend's phone sends their stream, show it
-    peerConnection.ontrack = (event) => {
-        remoteVideo.srcObject = event.streams[0];
-    };
+  peerConnection = new RTCPeerConnection(config);
 
-    // Send connection paths to the server
-    peerConnection.onicecandidate = (event) => {
-        if (event.candidate) {
-            socket.emit('signal', { room: room, candidate: event.candidate });
-        }
-    };
-    
-    // Listen for signals from the Render server
-    socket.on('signal', async (data) => {
-        if (data.sdp) {
-            await peerConnection.setRemoteDescription(new RTCSessionDescription(data.sdp));
-            if (data.sdp.type === 'offer') {
-                const answer = await peerConnection.createAnswer();
-                await peerConnection.setLocalDescription(answer);
-                socket.emit('signal', { room: room, sdp: peerConnection.localDescription });
-            }
-        } else if (data.candidate) {
-            await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-        }
+  // Add local tracks (if we already have them)
+  if (stream) {
+    stream.getTracks().forEach(track => {
+      peerConnection.addTrack(track, stream);
     });
-    
-    // When a friend joins and is ready, start the call
-    socket.on('ready', async (peerId) => {
-        if (peerId !== socket.id) {
-            const offer = await peerConnection.createOffer();
-            await peerConnection.setLocalDescription(offer);
-            socket.emit('signal', { room: room, sdp: peerConnection.localDescription });
-            callButton.textContent = "Chatting! 🥳";
-            callButton.disabled = true;
-        }
-    });
+  }
+
+  // When we get a remote track, show it
+  peerConnection.ontrack = (event) => {
+    console.log('ontrack', event);
+    remoteVideo.srcObject = event.streams[0];
+  };
+
+  // Gather ICE candidates and send to other peer
+  peerConnection.onicecandidate = (event) => {
+    if (event.candidate) {
+      socket.emit('signal', { room, candidate: event.candidate });
+    }
+  };
+
+  // Optional: when negotiation is needed (rare with explicit ready-flow)
+  peerConnection.onnegotiationneeded = async () => {
+    try {
+      if (!peerConnection) return;
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      socket.emit('signal', { room, sdp: peerConnection.localDescription });
+    } catch (err) {
+      console.error('Negotiation error', err);
+    }
+  };
+
+  peerConnection.onconnectionstatechange = () => {
+    console.log('Connection state:', peerConnection.connectionState);
+    if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed') {
+      callButton.textContent = 'Start a Sparkle Call';
+      callButton.disabled = false;
+    }
+  };
 }
+
+// Clean up when closing the page
+window.addEventListener('beforeunload', () => {
+  try {
+    if (peerConnection) peerConnection.close();
+    socket.disconnect();
+  } catch (e) {}
+});
