@@ -1,31 +1,36 @@
 const express = require('express');
+const path = require('path');
 const app = express();
 const http = require('http').Server(app);
-// Use the 'socket.io' library for real-time signaling
-const io = require('socket.io')(http); 
-const PORT = process.env.PORT || 3000; // Render will use its own PORT number
+const io = require('socket.io')(http);
+const PORT = process.env.PORT || 3000;
 
-// Serve static files (html/css/js) from the same folder
-app.use(express.static(__dirname));
+// Serve all front-end files from /public
+app.use(express.static(path.join(__dirname, 'public')));
 
-// The server's main function starts here
 io.on('connection', (socket) => {
-  console.log('A user connected:', socket.id);
-  
-  socket.on('join', (room) => {
-    socket.join(room);
-    console.log(`User ${socket.id} joined room: ${room}`);
-    // Notify the room that a new user is ready to connect
-    socket.to(room).emit('ready', socket.id);
-  });
-  
-  // This passes the WebRTC connection data between the two browsers
-  socket.on('signal', (data) => {
-    socket.to(data.room).emit('signal', data);
-  });
+    console.log('A user connected:', socket.id);
+
+    // User joins a room
+    socket.on('join', (room) => {
+        socket.join(room);
+        console.log(`User ${socket.id} joined room: ${room}`);
+        // Notify the other peer that someone joined
+        socket.to(room).emit('ready', socket.id);
+    });
+
+    // Relay any WebRTC signal (SDP or ICE)
+    socket.on('signal', (data) => {
+        console.log(`Signal from ${socket.id} to room ${data.room}`);
+        socket.to(data.room).emit('signal', data);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('User disconnected:', socket.id);
+    });
 });
 
-// Render starts the server on the correct port
+// Start server
 http.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
